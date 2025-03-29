@@ -8,23 +8,23 @@ import platform
 from PIL import Image, ImageDraw, ImageFont
 import sys
 import io
-import tempfile # <--- 新增导入 tempfile
-import uuid     # <--- 新增导入 uuid 用于生成唯一文件名
+import tempfile
+import uuid
 
-# --- 配置 (保持不变) ---
+# --- 配置 ---
 FONT_SIZE = 14
 LINE_SPACING = 4
 PADDING = 20
 BACKGROUND_COLOR = (25, 25, 25)
 TEXT_COLOR = (230, 230, 230)
-IMAGE_FORMAT = 'PNG' # 可以定义图片格式
+IMAGE_FORMAT = 'PNG'
 
-# --- 助手函数 (保持不变) ---
-# ... (format_bytes, format_uptime, create_bar, get_cpu_temperature, get_network_type 代码省略) ...
+# --- 助手函数 ---
 def format_bytes(size):
     power = 2**10; n = 0; power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
     while size >= power and n < len(power_labels) -1: size /= power; n += 1
     return f"{size:.1f} {power_labels[n]}B"
+
 def format_uptime(seconds):
     delta = datetime.timedelta(seconds=seconds); days = delta.days; hours, rem = divmod(delta.seconds, 3600); minutes, _ = divmod(rem, 60)
     parts = []; P=parts.append
@@ -32,10 +32,12 @@ def format_uptime(seconds):
     if hours > 0: P(f"{hours}小时")
     if minutes > 0 or (days == 0 and hours == 0): P(f"{minutes}分钟")
     return " ".join(parts) if parts else "小于1分钟"
+
 def create_bar(percent, length=15):
     if not 0 <= percent <= 100: percent = 0
     filled_length = int(length * percent // 100); bar = '■' * filled_length + '□' * (length - filled_length)
     return f"[{bar}]"
+
 def get_cpu_temperature():
     if hasattr(psutil, "sensors_temperatures"):
         temps = psutil.sensors_temperatures()
@@ -44,6 +46,7 @@ def get_cpu_temperature():
                 if 'core' in entry.label.lower() or 'cpu' in entry.label.lower() or name in ('coretemp', 'k10temp', 'cpu_thermal'): return f"{entry.current:.1f}°C"
                 if entries: return f"{entries[0].current:.1f}°C"
     return "N/A"
+
 def get_network_type(interface_name):
     name_lower = interface_name.lower()
     if name_lower.startswith(('eth', 'en')): return "有线网络"
@@ -52,13 +55,15 @@ def get_network_type(interface_name):
     if name_lower.startswith(('docker', 'veth', 'br-')): return "虚拟/容器网络"
     return "未知类型"
 
-# --- 主要数据获取函数 (保持不变) ---
+# --- 主要数据获取函数 ---
 def get_system_status_text():
     """获取所有系统状态信息并返回一个字符串列表。"""
     output_lines = []
+    
     # System Info
     boot_time_timestamp = psutil.boot_time(); uptime_seconds = time.time() - boot_time_timestamp; uname = platform.uname(); py_version = platform.python_version()
     output_lines.extend(["┌── 系统信息 ────────────────────", "│", f"│ 运行时间: {format_uptime(uptime_seconds)}", f"│ Python版本: v{py_version}", f"│ 操作系统: {uname.system} {uname.release}", f"│ 主机名: {socket.gethostname()}", "│ "])
+    
     # System Load
     cpu_cores = psutil.cpu_count(logical=True); 
     try:
@@ -80,43 +85,77 @@ def get_system_status_text():
     else: output_lines.append("│ SWAP: 未启用")
     output_lines.append("│ ")
     
-    # Disk Info
+    # Disk Info - 优化版本，只显示主要磁盘
     output_lines.append("┌── 磁盘信息 ─────────────────────")
-    partitions = psutil.disk_partitions(); added_disk_info = False
+    
+    # 获取所有分区
+    partitions = psutil.disk_partitions()
+    
+    # 过滤出真实磁盘，排除系统文件和重复挂载点
+    real_partitions = []
+    seen_mount_stats = {}  # 用于跟踪已经处理过的挂载点的统计信息
+    
     for part in partitions:
-        if 'loop' in part.device or part.fstype in ('squashfs', 'tmpfs', 'iso9660') or not os.path.exists(part.mountpoint): continue
+        # 跳过循环设备、临时文件系统、不存在的挂载点和特定系统文件
+        if ('loop' in part.device or 
+            part.fstype in ('squashfs', 'tmpfs', 'iso9660') or 
+            not os.path.exists(part.mountpoint) or
+            part.mountpoint.startswith('/etc/') or  # 排除/etc下的文件挂载
+            part.mountpoint.startswith('/proc/') or # 排除/proc下的文件挂载
+            part.mountpoint.startswith('/sys/') or  # 排除/sys下的文件挂载
+            part.mountpoint.startswith('/run/') or  # 排除/run下的文件挂载
+            part.mountpoint.startswith('/dev/')):   # 排除/dev下的文件挂载
+            continue
+        
         try:
             usage = psutil.disk_usage(part.mountpoint)
-            if usage.total < 1 * (1024**3): continue
-            if added_disk_info: output_lines.append("│")
-            output_lines.extend([f"│ 挂载点: {part.mountpoint}", f"│ 总空间: {format_bytes(usage.total)}", f"│ 已用空间: {format_bytes(usage.used)} {create_bar(usage.percent)} {usage.percent:.1f}%", f"│ 可用空间: {format_bytes(usage.free)}"])
-            added_disk_info = True
-        except Exception as e: continue
-    if not added_disk_info: output_lines.append("│ 未找到或无法读取主要磁盘信息。")
-    output_lines.append("│ ")
+            
+            # 只显示大于1GB的分区
+            if usage.total < 1 * (1024**3):
+                continue
+            
+            # 检查是否已经有相同大小和使用率的分区
+            # 这可以帮助过滤掉重复的挂载点（通常是同一个物理磁盘的不同视图）
+            key = (usage.total, usage.used)
+            if key in seen_mount_stats:
+                # 如果已存在，只保留路径较短的那个（通常是主挂载点）
+                if len(part.mountpoint) < len(seen_mount_stats[key]):
+                    # 替换为更短的路径
+                    for i, p in enumerate(real_partitions):
+                        if p[0] == seen_mount_stats[key]:
+                            real_partitions[i] = (part.mountpoint, usage)
+                            seen_mount_stats[key] = part.mountpoint
+                            break
+            else:
+                real_partitions.append((part.mountpoint, usage))
+                seen_mount_stats[key] = part.mountpoint
+                
+        except Exception:
+            continue
     
-    # Network Info - 简化版，不测量速度
-    output_lines.append("┌── 网络信息 ─────────────────────")
-    try:
-        net_if_addrs = psutil.net_if_addrs(); added_net_info = False
-        for interface, addrs in net_if_addrs.items():
-            if interface == 'lo' or interface.startswith(('veth', 'br-', 'docker')): continue
-            ip_addr, mac_addr = "N/A", "N/A"
-            for addr in addrs:
-                if addr.family == socket.AF_INET: ip_addr = addr.address
-                elif addr.family == psutil.AF_LINK: mac_addr = addr.address
-            if ip_addr != "N/A":  # 只显示有IP地址的接口
-                if added_net_info: output_lines.append("│")
-                output_lines.extend([f"│ 网卡名称: {interface}", f"│ IP地址: {ip_addr}", f"│ MAC地址: {mac_addr}"])
-                added_net_info = True
-        if not added_net_info: output_lines.append("│ 未找到活动的网络接口。")
-    except:
-        output_lines.append("│ 获取网络信息时出错")
+    # 按照挂载点排序，通常根目录会排在前面
+    real_partitions.sort(key=lambda x: x[0])
     
+    # 添加磁盘信息到输出
+    if real_partitions:
+        for i, (mountpoint, usage) in enumerate(real_partitions):
+            if i > 0:
+                output_lines.append("│")
+            output_lines.extend([
+                f"│ 挂载点: {mountpoint}",
+                f"│ 总空间: {format_bytes(usage.total)}",
+                f"│ 已用空间: {format_bytes(usage.used)} {create_bar(usage.percent)} {usage.percent:.1f}%",
+                f"│ 可用空间: {format_bytes(usage.free)}"
+            ])
+    else:
+        output_lines.append("│ 未找到或无法读取主要磁盘信息。")
+    
+    # 添加结束行
     output_lines.append("└───────────────────────────────────")
+    
     return output_lines
 
-# --- 查找系统字体函数 (保持不变，安静模式) ---
+# --- 查找系统字体函数 ---
 def find_system_mono_font(font_size):
     """尝试查找并加载一个合适的系统自带等宽字体 (安静模式)。"""
     os_name = platform.system(); font = None
@@ -130,7 +169,7 @@ def find_system_mono_font(font_size):
         except (IOError, OSError): continue
     return font
 
-# --- 修改: 生成图片并保存到脚本所在目录，返回文件路径 ---
+# --- 生成图片并保存到脚本所在目录，返回文件路径 ---
 def generate_and_save_image_to_script_dir(lines, font_size=FONT_SIZE):
     """将文本行列表渲染到图片上，保存到脚本所在目录的cache文件夹，并返回该文件的绝对路径。"""
 
@@ -158,7 +197,7 @@ def generate_and_save_image_to_script_dir(lines, font_size=FONT_SIZE):
     font = find_system_mono_font(font_size)
     if font is None: return None # 找不到字体则失败
 
-    # 计算图片尺寸 (代码与之前类似，省略)
+    # 计算图片尺寸
     draw = ImageDraw.Draw(Image.new('RGB', (1, 1))); max_width = 0; line_heights = []
     for line in lines:
         try:
@@ -193,7 +232,7 @@ def generate_and_save_image_to_script_dir(lines, font_size=FONT_SIZE):
         print(f"错误：无法将图片保存到缓存目录: {e}")
         return None
 
-# --- 修改: 供外部调用的主函数 ---
+# --- 供外部调用的主函数 ---
 def generate_status_image_local_path():
     """
     获取系统状态文本，不再生成图片。
